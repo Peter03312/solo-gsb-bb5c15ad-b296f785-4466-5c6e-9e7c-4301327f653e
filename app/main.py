@@ -26,13 +26,15 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
         "各区保留不可变历史版本。批量提交车辆轨迹点，按最新配置或指定修订号查询"
         "各危险区的穿越区间与累计时长。支持现场采集点误录后的整组原子更正"
-        "（撤销/改写、乐观版本、不可变前后值履历），车次轨迹按版本管理。"
+        "（撤销/改写、乐观版本、不可变前后值履历），车次轨迹按版本管理；"
+        "每个生效版本原子保留完整有效点集快照，穿越查询可指定车次轨迹版本按当时点集复现，"
+        "并可与区域修订号同时使用。"
     ),
 )
 
@@ -184,9 +186,24 @@ def get_crossings(
             "响应回填该 revision；省略则按最新配置，响应语义不变"
         ),
     ),
+    track_version: Optional[int] = Query(
+        default=None,
+        ge=0,
+        alias="track_version",
+        description=(
+            "可选车次轨迹版本：按该版本当时的有效点集复现穿越，"
+            "响应回填实际使用的 track_version；省略则按当前点集，响应语义不变。"
+            "可与 revision 同时指定；版本不存在、早于基线或晚于当前返回 404"
+        ),
+    ),
 ) -> dict:
     return service.query_crossings(
-        trip_id, zone_id=zone_id, since=since, until=until, revision_raw=revision
+        trip_id,
+        zone_id=zone_id,
+        since=since,
+        until=until,
+        revision_raw=revision,
+        track_version_raw=track_version,
     )
 
 

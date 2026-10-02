@@ -46,6 +46,23 @@ def _validate_revision_param(raw: Any) -> int:
     return value
 
 
+def _validate_track_version_param(raw: Any) -> int:
+    """校验查询参数 track_version：必须是 >=0 的整数（0 仅可能是既有车次基线）。"""
+    if isinstance(raw, bool):
+        raise ValidationError(f"track_version 必须是非负整数，收到: {raw!r}")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        text = str(raw).strip()
+        try:
+            value = int(text)
+        except (TypeError, ValueError):
+            raise ValidationError(f"track_version 必须是非负整数，收到: {raw!r}")
+    if value < 0:
+        raise ValidationError(f"track_version 必须是非负整数（>=0），收到: {value}")
+    return value
+
+
 def _row_to_zone(row: Any, *, include_revision: bool = True) -> Dict[str, Any]:
     windows_raw = json.loads(row["windows"])
     body: Dict[str, Any] = {
@@ -322,8 +339,20 @@ class AuditService:
                 # 真正录入新点：版本恰好推进一次（纯幂等重传不推进）
                 vrow = self.db._trip_version_row(conn, trip_id)
                 next_version = 1 if vrow is None else int(vrow["version"]) + 1
-                self.db.upsert_trip_version(
-                    conn, trip_id, next_version, _iso_z(datetime.now(timezone.utc))
+                now_iso = _iso_z(datetime.now(timezone.utc))
+                # 同一事务：版本指针 + 版本登记 + 该版本完整有效点集快照，原子保留
+                self.db.upsert_trip_version(conn, trip_id, next_version, now_iso)
+                self.db.insert_trip_version_event(
+                    conn, trip_id, next_version, "points", now_iso
+                )
+                self.db.insert_trip_point_snapshot(
+                    conn,
+                    trip_id,
+                    next_version,
+                    [
+                        (r["point_id"], r["ts_epoch"], r["x"], r["y"])
+                        for r in self.db._list_trip_points(conn, trip_id)
+                    ],
                 )
 
         return {
@@ -407,6 +436,18 @@ class AuditService:
                 if not existing and not self.db.list_revoked_ids(conn, trip_id):
                     raise NotFoundError(f"车次不存在（无轨迹点，无法更正）: {trip_id}")
                 current_version = 0
+                now_baseline = _iso_z(datetime.now(timezone.utc))
+                # 同一事务补齐 0 号基线：版本指针 + baseline 登记 + 当时完整点集快照
+                self.db.upsert_trip_version(conn, trip_id, 0, now_baseline)
+                self.db.insert_trip_version_event(
+                    conn, trip_id, 0, "baseline", now_baseline
+                )
+                self.db.insert_trip_point_snapshot(
+                    conn,
+                    trip_id,
+                    0,
+                    [(r["point_id"], r["ts_epoch"], r["x"], r["y"]) for r in existing],
+                )
             else:
                 current_version = int(vrow["version"])
 
@@ -493,6 +534,20 @@ class AuditService:
                          r["ts_epoch"], r["x"], r["y"], None, None, None, now_iso)
                     )
             self.db.insert_point_corrections(conn, history_rows)
+
+            # 同一事务登记新版本（correction）并保留更正后完整有效点集快照（可能为空）
+            self.db.insert_trip_version_event(
+                conn, trip_id, new_version, "correction", now_iso
+            )
+            self.db.insert_trip_point_snapshot(
+                conn,
+                trip_id,
+                new_version,
+                [
+                    (r["point_id"], r["ts_epoch"], r["x"], r["y"])
+                    for r in self.db._list_trip_points(conn, trip_id)
+                ],
+            )
 
         return {
             "trip_id": trip_id,
@@ -589,6 +644,29 @@ class AuditService:
     # 穿越审计
     # ------------------------------------------------------------------
 
+    def _resolve_track_version(self, conn: Any, trip_id: str, raw: Any) -> int:
+        """校验指定轨迹版本并在只读快照内解析；不存在/早于基线/晚于当前均明确 404。
+
+        以 ``trip_version_events`` 的最早行为最早可追溯基线（不推造更早轨迹），
+        以最新行为当前版本；全部撤销后版本仍有登记行，空点集版本同样可查。
+        """
+        version = _validate_track_version_param(raw)
+        bounds = self.db.trip_version_bounds(conn, trip_id)
+        if bounds is None:
+            # 无任何版本登记：无论是否有游离点，均视为该车次无可复现版本
+            raise NotFoundError(f"车次不存在或无任何可追溯轨迹版本: {trip_id}")
+        baseline, current = bounds
+        if version < baseline:
+            raise NotFoundError(
+                f"轨迹版本 {version} 早于最早可追溯基线：车次 {trip_id} "
+                f"最早可追溯版本为 {baseline}（基线之前的轨迹不可复原）"
+            )
+        if version > current:
+            raise NotFoundError(
+                f"轨迹版本 {version} 晚于当前版本：车次 {trip_id} 当前轨迹版本为 {current}"
+            )
+        return version
+
     def query_crossings(
         self,
         trip_id: str,
@@ -596,6 +674,7 @@ class AuditService:
         since: Optional[str] = None,
         until: Optional[str] = None,
         revision_raw: Any = None,
+        track_version_raw: Any = None,
     ) -> Dict[str, Any]:
         try:
             lo = parse_utc(since, field="since").timestamp() if since else None
@@ -605,29 +684,37 @@ class AuditService:
         if lo is not None and hi is not None and lo >= hi:
             raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
 
-        pinned = revision_raw is not None
-        revision = self._resolve_revision(revision_raw) if pinned else None
+        pinned_revision = revision_raw is not None
+        revision = self._resolve_revision(revision_raw) if pinned_revision else None
+        pinned_track = track_version_raw is not None
 
         with self.db.read_view() as conn:
-            points = self.db._list_trip_points(conn, trip_id)
-            if len(points) < 2:
+            if pinned_track:
+                track_version = self._resolve_track_version(conn, trip_id, track_version_raw)
+                point_rows = self.db.list_trip_snapshot_points(conn, trip_id, track_version)
+            else:
+                track_version = None
+                point_rows = self.db._list_trip_points(conn, trip_id)
+            if len(point_rows) < 2:
                 result: Dict[str, Any] = {
                     "trip_id": trip_id,
-                    "point_count": len(points),
+                    "point_count": len(point_rows),
                     "zones": [],
                 }
-                if pinned:
+                if pinned_revision:
                     result["revision"] = revision
+                if pinned_track:
+                    result["track_version"] = track_version
                 return result
 
-            if pinned:
+            if pinned_revision:
                 zone_rows = self.db._list_zone_rows_at(conn, revision)
             else:
                 zone_rows = self.db._list_latest_zone_rows(conn)
             if zone_id is not None:
                 zone_rows = [r for r in zone_rows if r["zone_id"] == zone_id]
                 if not zone_rows:
-                    if pinned:
+                    if pinned_revision:
                         # 指定版本中尚未登记的区域不参与核算
                         raise NotFoundError(
                             f"修订号 {revision} 的配置中危险区尚未登记: {zone_id}"
@@ -636,16 +723,18 @@ class AuditService:
 
             zone_results: List[Dict[str, Any]] = []
             for zrow in zone_rows:
-                zone_result = self._crossing_for_zone(zrow, points, lo, hi)
+                zone_result = self._crossing_for_zone(zrow, point_rows, lo, hi)
                 zone_results.append(zone_result)
 
         result = {
             "trip_id": trip_id,
-            "point_count": len(points),
+            "point_count": len(point_rows),
             "zones": zone_results,
         }
-        if pinned:
+        if pinned_revision:
             result["revision"] = revision
+        if pinned_track:
+            result["track_version"] = track_version
         return result
 
     def _crossing_for_zone(

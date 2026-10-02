@@ -12,6 +12,11 @@
 ----------------------
 - ``trip_versions`` 每车次一行记录当前轨迹版本：升级前已有点的车次首次启动时迁移为
   版本 0 基线；之后每批真正录入新点或每批成功更正各推进一次，纯幂等重传不推进。
+- ``trip_version_events`` 只追加登记**每一个生效版本**（基线 baseline / 新点批 points /
+  成功更正 correction）。版本号连续、最早一行即“最早可追溯基线”，用于判定请求的轨迹版本
+  是否存在、早于基线或晚于当前；纯幂等重传不登记。
+- ``trip_point_snapshots`` 在版本生效的同一事务内保留该版本**完整有效点集快照**
+  （只追加、不可变），即使版本点集为空（全部撤销）也保留版本登记行；按版本复现穿越即取此快照。
 - ``revoked_points`` 永久登记已撤销点（撤销即从 points 有效集移除），已撤销 ID 不得经上传重用。
 - ``point_corrections`` 为只追加、不可改的前后值履历（action=update/revoke、前后时刻坐标、
   生效版本与更正时间），仅在整组更正成功的同一事务内写入。
@@ -71,6 +76,32 @@ CREATE TABLE IF NOT EXISTS trip_versions (
     version    INTEGER NOT NULL,          -- 当前轨迹版本号（基线为 0）
     updated_at TEXT NOT NULL
 );
+
+-- 每个生效轨迹版本的登记流水（只追加、不可变）。纯幂等重传不登记版本。
+-- kind: baseline=升级时既有车次当前点集基线（version=0）；points=真正录入新点的批次；
+--       correction=成功更正批次。最早一行的版本即该车次最早可追溯基线。
+CREATE TABLE IF NOT EXISTS trip_version_events (
+    trip_id    TEXT NOT NULL,
+    version    INTEGER NOT NULL,          -- 该事件生效后的轨迹版本号
+    kind       TEXT NOT NULL,             -- baseline | points | correction
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (trip_id, version)
+);
+
+-- 各版本完整有效点集快照（只追加、不可变）：版本与点集在同一事务内原子保留，
+-- 足以复原该版本的有效点集。版本点集为空（全部撤销）时不插快照点，版本登记行仍在。
+CREATE TABLE IF NOT EXISTS trip_point_snapshots (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    trip_id    TEXT NOT NULL,
+    version    INTEGER NOT NULL,
+    point_id   TEXT NOT NULL,
+    ts_epoch   REAL NOT NULL,
+    x          REAL NOT NULL,
+    y          REAL NOT NULL,
+    UNIQUE (trip_id, version, point_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trip_snapshots_ver
+    ON trip_point_snapshots(trip_id, version, ts_epoch, id);
 
 -- 已撤销点：撤销即从 points 有效集移除并在此永久登记；已撤销 ID 不得经上传重用。
 CREATE TABLE IF NOT EXISTS revoked_points (
@@ -193,15 +224,49 @@ class Database:
     def _baseline_existing_trips(self, conn: sqlite3.Connection) -> None:
         """既有车次（功能上线前已有点）一次性登记为轨迹版本 0 基线。
 
-        幂等：trip_versions 已存在的车次不重复登记；新功能上线后首次上传的车次
-        在上传事务内直接建立版本 1，不经过此路径。
+        基线为“升级时当时的当前版本与点集”，不推造更早轨迹。在单事务内原子完成：
+        插入 trip_versions(0)、登记 trip_version_events(baseline,0)、保留当时完整有效
+        点集快照 trip_point_snapshots(0)。
+
+        幂等：重启再跑时 trip_version_events 已有 baseline 的车次整组跳过
+        （版本指针、事件、快照三者同事务插入，不会出现半成品）；新功能上线后首次上传
+        的车次在上传事务内直接建立版本 1，不经过此路径。
         """
         now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        conn.execute(
-            "INSERT OR IGNORE INTO trip_versions(trip_id, version, updated_at) "
-            "SELECT DISTINCT trip_id, 0, ? FROM points",
-            (now_iso,),
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            trip_ids = [
+                r[0]
+                for r in conn.execute("SELECT DISTINCT trip_id FROM points ORDER BY trip_id")
+            ]
+            for trip_id in trip_ids:
+                existed = conn.execute(
+                    "SELECT 1 FROM trip_version_events WHERE trip_id=? AND version=0",
+                    (trip_id,),
+                ).fetchone()
+                if existed is not None:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO trip_versions(trip_id, version, updated_at) "
+                    "VALUES (?, 0, ?)",
+                    (trip_id, now_iso),
+                )
+                conn.execute(
+                    "INSERT INTO trip_version_events(trip_id, version, kind, created_at) "
+                    "VALUES (?, 0, 'baseline', ?)",
+                    (trip_id, now_iso),
+                )
+                conn.execute(
+                    "INSERT INTO trip_point_snapshots"
+                    "(trip_id, version, point_id, ts_epoch, x, y) "
+                    "SELECT trip_id, 0, point_id, ts_epoch, x, y FROM points "
+                    "WHERE trip_id = ? ORDER BY ts_epoch, point_id",
+                    (trip_id,),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -423,6 +488,77 @@ class Database:
             (trip_id, version, updated_iso),
         )
 
+    # ----- 轨迹版本登记与点集快照（只追加、不可变） ---------------------------
+
+    @staticmethod
+    def insert_trip_version_event(
+        conn: sqlite3.Connection,
+        trip_id: str,
+        version: int,
+        kind: str,
+        created_iso: str,
+    ) -> None:
+        """登记一个生效轨迹版本（baseline | points | correction）。"""
+        conn.execute(
+            "INSERT INTO trip_version_events(trip_id, version, kind, created_at) "
+            "VALUES (?,?,?,?)",
+            (trip_id, version, kind, created_iso),
+        )
+
+    @staticmethod
+    def insert_trip_point_snapshot(
+        conn: sqlite3.Connection,
+        trip_id: str,
+        version: int,
+        rows: List[Tuple[str, float, float, float]],
+    ) -> None:
+        """保留某版本的完整有效点集快照（point_id, ts_epoch, x, y）。"""
+        conn.executemany(
+            "INSERT INTO trip_point_snapshots"
+            "(trip_id, version, point_id, ts_epoch, x, y) VALUES (?,?,?,?,?,?)",
+            [(trip_id, version, pid, ts_epoch, x, y) for pid, ts_epoch, x, y in rows],
+        )
+
+    @staticmethod
+    def trip_version_bounds(
+        conn: sqlite3.Connection, trip_id: str
+    ) -> Optional[Tuple[int, int]]:
+        """车次可追溯版本范围 (最早基线, 当前)；从未登记任何版本返回 None。"""
+        cur = conn.execute(
+            "SELECT MIN(version) AS lo, MAX(version) AS hi "
+            "FROM trip_version_events WHERE trip_id = ?",
+            (trip_id,),
+        )
+        row = cur.fetchone()
+        if row is None or row["hi"] is None:
+            return None
+        return int(row["lo"]), int(row["hi"])
+
+    @staticmethod
+    def list_trip_snapshot_points(
+        conn: sqlite3.Connection, trip_id: str, version: int
+    ) -> List[sqlite3.Row]:
+        """取某版本快照有效点（按时刻排序）；版本无快照点（全部撤销）返回空列表。"""
+        return list(
+            conn.execute(
+                "SELECT point_id, ts_epoch, x, y FROM trip_point_snapshots "
+                "WHERE trip_id = ? AND version = ? ORDER BY ts_epoch, id",
+                (trip_id, version),
+            )
+        )
+
+    @staticmethod
+    def list_trip_version_event_rows(
+        conn: sqlite3.Connection, trip_id: str
+    ) -> List[sqlite3.Row]:
+        """车次各生效版本登记流水（按版本升序）。"""
+        return list(
+            conn.execute(
+                "SELECT * FROM trip_version_events WHERE trip_id = ? ORDER BY version",
+                (trip_id,),
+            )
+        )
+
     # ----- 已撤销点 ----------------------------------------------------------
 
     @staticmethod
@@ -493,7 +629,10 @@ class Database:
             conn.execute("DELETE FROM points")
             conn.execute("DELETE FROM zone_revisions")
             conn.execute("DELETE FROM trip_versions")
+            conn.execute("DELETE FROM trip_version_events")
+            conn.execute("DELETE FROM trip_point_snapshots")
             conn.execute("DELETE FROM revoked_points")
             conn.execute("DELETE FROM point_corrections")
             conn.execute("DELETE FROM sqlite_sequence WHERE name='zone_revisions'")
             conn.execute("DELETE FROM sqlite_sequence WHERE name='point_corrections'")
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='trip_point_snapshots'")
