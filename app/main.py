@@ -26,13 +26,15 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
         "各区保留不可变历史版本。批量提交车辆轨迹点，按最新配置或指定修订号查询"
         "各危险区的穿越区间与累计时长。支持现场采集点误录后的整组原子更正"
-        "（撤销/改写、乐观版本、不可变前后值履历），车次轨迹按版本管理。"
+        "（撤销/改写、乐观版本、不可变前后值履历），车次轨迹按版本管理，"
+        "每批真正录入新点或成功更正原子保留该版本全量有效点集，"
+        "穿越审计可同时指定轨迹版本与区域修订号复现历史现场。"
     ),
 )
 
@@ -73,6 +75,7 @@ def index() -> dict:
             "POST /api/v1/trips/{trip_id}/corrections",
             "GET  /api/v1/trips/{trip_id}",
             "GET  /api/v1/trips/{trip_id}/corrections",
+            "GET  /api/v1/trips/{trip_id}/versions",
             "GET  /api/v1/trips/{trip_id}/crossings",
         ],
     }
@@ -160,6 +163,18 @@ def get_corrections(trip_id: str) -> JSONResponse:
     return JSONResponse(content=detail)
 
 
+@app.get("/api/v1/trips/{trip_id}/versions")
+def get_trip_versions(trip_id: str) -> JSONResponse:
+    """车次已保留的轨迹版本流水（按版本升序，含基线版本与各版本有效点数）。"""
+    detail = service.list_trip_versions(trip_id)
+    if detail is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found", "detail": f"车次不存在（无轨迹数据）: {trip_id}"},
+        )
+    return JSONResponse(content=detail)
+
+
 @app.get("/api/v1/trips/{trip_id}")
 def get_trip(trip_id: str) -> JSONResponse:
     detail = service.get_trip(trip_id)
@@ -184,9 +199,23 @@ def get_crossings(
             "响应回填该 revision；省略则按最新配置，响应语义不变"
         ),
     ),
+    track_version: Optional[int] = Query(
+        default=None,
+        ge=0,
+        alias="track_version",
+        description=(
+            "可选轨迹版本号：按该版本保留的有效点集复现穿越，响应回填实际使用的 "
+            "track_version；省略则按当前有效点集，响应语义不变。可与 revision 同时指定"
+        ),
+    ),
 ) -> dict:
     return service.query_crossings(
-        trip_id, zone_id=zone_id, since=since, until=until, revision_raw=revision
+        trip_id,
+        zone_id=zone_id,
+        since=since,
+        until=until,
+        revision_raw=revision,
+        track_version_raw=track_version,
     )
 
 
